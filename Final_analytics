@@ -1,0 +1,305 @@
+# ==================== IMPORTS ====================
+
+import random           # Random mine placement
+import time             # Timing for game analytics / delays
+import csv              # Save/load board data to CSV
+import tkinter as tk    # GUI toolkit
+from tkinter import messagebox       # For pop-up messages
+from tkinter import simpledialog     # For user input dialogs
+
+# Analytics imports (NumPy, Matplotlib, SciPy)
+try:
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    from scipy.ndimage import label      # Cluster detection for mines
+    ANALYTICS_AVAILABLE = True
+except ImportError:
+    ANALYTICS_AVAILABLE = False
+    print("Warning: Analytics libraries not found. Install with: pip install numpy matplotlib scipy")
+
+
+# ==================== DIFFICULTY PRESETS ====================
+
+EASY = {'rows': 9, 'cols': 9, 'mines': 10}              # Beginner difficulty
+INTERMEDIATE = {'rows': 16, 'cols': 16, 'mines': 40}    # Intermediate difficulty
+EXPERT = {'rows': 16, 'cols': 30, 'mines': 99}          # Expert difficulty
+
+SCORE_FILE = 'highscores.txt'         # Save scores
+BOARD_FILE = "grid_matrix.txt"        # Save matrix in plain text
+BOARD_FILE_CSV = "grid_matrix.csv"    # Save matrix in CSV format
+
+
+# ==================== ANALYTICS / HEATMAP FUNCTIONS ====================
+
+def load_boards_from_csv(filename):
+    """Load all boards from CSV file and return them as numpy matrices."""
+    boards = []             # All loaded boards
+    current_board = []      # Board currently being parsed
+
+    try:
+        with open(filename, 'r', newline='') as file:
+            reader = csv.reader(file)
+
+            for row in reader:
+                if not row:
+                    continue  # Skip empty rows
+
+                first = str(row[0]).strip()
+
+                # Detect "Output:" which separates boards
+                if first in ("Output:", "Output"):
+                    if current_board:
+                        boards.append(np.array(current_board, dtype=object))
+                        current_board = []
+                    else:
+                        current_board = []
+                else:
+                    parsed_row = []
+
+                    # Handle rows that are space-separated but in 1 column
+                    if len(row) == 1 and isinstance(row[0], str) and (' ' in row[0]) and (',' not in row[0]):
+                        split_cells = row[0].split()
+                    else:
+                        split_cells = row
+
+                    # Parse each cell
+                    for cell in split_cells:
+                        cell_str = str(cell).strip()
+                        if cell_str == '':
+                            continue
+                        if cell_str == 'M':
+                            parsed_row.append('M')
+                        else:
+                            try:
+                                parsed_row.append(int(cell_str))
+                            except ValueError:
+                                parsed_row.append(cell_str)
+
+                    if parsed_row:
+                        current_board.append(parsed_row)
+
+            if current_board:
+                boards.append(np.array(current_board, dtype=object))
+
+    except FileNotFoundError:
+        print(f"CSV file not found: {filename}")
+        return []
+
+    except Exception as e:
+        print(f"Error loading boards from CSV: {e}")
+        return []
+
+    # Sanitize only rectangular boards
+    sanitized = []
+    for b in boards:
+        try:
+            arr = np.array(b, dtype=object)
+            row_lens = [len(r) for r in arr.tolist()]
+            if len(set(row_lens)) == 1:
+                sanitized.append(arr)
+        except Exception:
+            continue
+
+    return sanitized
+
+
+
+def count_white_cells(board):
+    """Count cells with 0 (white/no adjacent mines)."""
+    count = 0
+    rows, cols = board.shape
+    for i in range(rows):
+        for j in range(cols):
+            cell = board[i][j]
+            if isinstance(cell, (int, np.integer)) and int(cell) == 0:
+                count += 1
+    return count
+
+
+
+def get_number_distribution(boards):
+    """Count how many times each number 0–8 appears in all boards."""
+    distribution = {i: 0 for i in range(9)}
+    for board in boards:
+        rows, cols = board.shape
+
+        for i in range(rows):
+            for j in range(cols):
+                cell = board[i][j]
+
+                if cell == 'M':
+                    continue
+
+                try:
+                    v = int(cell)
+                except:
+                    continue
+
+                if 0 <= v <= 8:
+                    distribution[v] += 1
+    return distribution
+
+
+
+def count_mine_clusters(board):
+    """Count number of connected mine clusters using SciPy label()."""
+    rows, cols = board.shape
+    mine_array = np.zeros((rows, cols), dtype=int)
+
+    for i in range(rows):
+        for j in range(cols):
+            if board[i][j] == 'M':
+                mine_array[i][j] = 1
+
+    structure = np.ones((3, 3))  # 8-connected neighbors
+
+    try:
+        labeled_array, num_clusters = label(mine_array, structure=structure)
+        return int(num_clusters)
+    except:
+        return int(np.sum(mine_array))
+
+
+
+def calculate_mine_heatmap_raw(boards, radius=4):
+    """Calculate average mine density in a radius around each cell."""
+    if not boards:
+        return None
+
+    rows, cols = boards[0].shape
+    heatmap = np.zeros((rows, cols), dtype=float)
+
+    for board in boards:
+        for i in range(rows):
+            for j in range(cols):
+
+                mine_count = 0
+
+                for di in range(-radius, radius + 1):
+                    for dj in range(-radius, radius + 1):
+
+                        ni, nj = i + di, j + dj
+
+                        if 0 <= ni < rows and 0 <= nj < cols:
+                            if board[ni][nj] == 'M':
+                                mine_count += 1
+
+                heatmap[i][j] += mine_count
+
+    heatmap /= float(len(boards))
+    return heatmap
+
+
+
+# ==================== COMBINED ANALYTICS FIGURE ====================
+
+def generate_combined_analytics_figure(boards, radius=4):
+    """Creates the 2×2 figure (histograms + heatmap)."""
+
+    rows, cols = boards[0].shape
+
+    # Collect stats
+    white_counts = [count_white_cells(b) for b in boards]
+    num_dist = get_number_distribution(boards)
+    cluster_counts = [count_mine_clusters(b) for b in boards]
+    raw_heatmap = calculate_mine_heatmap_raw(boards, radius)
+
+    # Create 2×2 plot
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # White cell histogram
+    ax = axes[0, 0]
+    ax.hist(white_counts, bins=10, color="#1f77b4")
+    ax.set_title("Histogram of Number of White Cells per Board")
+
+    # Number distribution bar chart
+    ax = axes[0, 1]
+    nums = list(num_dist.keys())
+    counts = list(num_dist.values())
+    ax.bar(nums, counts, color="#1f77b4")
+    ax.set_title("Distribution of Numbered Cells")
+
+    # Mine cluster histogram
+    ax = axes[1, 0]
+    ax.hist(cluster_counts, bins=10, color="#1f77b4")
+    ax.set_title("Mine Cluster Count Distribution")
+
+    # Heatmap
+    ax = axes[1, 1]
+    hm = ax.imshow(raw_heatmap, cmap="viridis")
+    ax.set_title("Average Mine Density Heatmap")
+    fig.colorbar(hm, ax=ax)
+
+    fig.tight_layout()
+    return fig
+
+
+
+# ==================== GENERATE ANALYTICS ====================
+
+def generate_analytics(csv_filename, output_pdf=None, show_plots=True, radius=4):
+    """Load boards, generate analytics, return summary stats."""
+
+    print(f"Loading boards from {csv_filename}...")
+    boards = load_boards_from_csv(csv_filename)
+
+    if not boards:
+        print("No boards found!")
+        return None
+
+    print(f"Loaded {len(boards)} boards.")
+    rows, cols = boards[0].shape
+    print(f"Board dimensions: {rows} × {cols}")
+
+    # Generate analytics figure
+    fig = generate_combined_analytics_figure(boards, radius)
+
+    # Save PDF if requested
+    if output_pdf:
+        try:
+            with PdfPages(output_pdf) as pdf:
+                pdf.savefig(fig, bbox_inches='tight')
+            print("PDF saved successfully!")
+        except Exception as e:
+            print(f"Failed to save PDF: {e}")
+
+    # Show plots if allowed
+    if show_plots:
+        plt.show()
+    else:
+        plt.close('all')
+
+    # Summary calculations
+    white_cells = [count_white_cells(board) for board in boards]
+    clusters = [count_mine_clusters(board) for board in boards]
+
+    summary = {
+        'num_boards': len(boards),
+        'board_dimensions': (rows, cols),
+        'white_cells_mean': float(np.mean(white_cells)),
+        'white_cells_median': float(np.median(white_cells)),
+        'white_cells_std': float(np.std(white_cells)),
+        'clusters_mean': float(np.mean(clusters)),
+        'clusters_median': float(np.median(clusters)),
+        'clusters_std': float(np.std(clusters)),
+    }
+
+    # Print summary
+    print("SUMMARY STATISTICS")
+    print(summary)
+
+    return summary
+
+
+
+# ==================== MINESWEEPER GAME ====================
+# Your Game, Board, CustomConfigDialog classes go here.
+# Since you said “remains unchanged” I am not rewriting that entire part.
+
+# ==================== RUN APPLICATION ====================
+
+if __name__ == "__main__":
+    window = tk.Tk()
+    game = Game(window)
+    window.mainloop()
